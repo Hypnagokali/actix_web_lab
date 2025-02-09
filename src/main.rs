@@ -1,7 +1,7 @@
 
-use std::{future::ready, ops::Deref, sync::Arc};
+use std::{future::ready, marker::PhantomData, ops::Deref, sync::Arc};
 
-use actix_web::{post, web::{Data, Json}, App, Error, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError};
+use actix_web::{post, web::{Data, Json}, App, Error, FromRequest, Handler, HttpRequest, HttpResponse, HttpServer, Responder, ResponseError};
 use futures::future::LocalBoxFuture;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -76,41 +76,55 @@ pub struct LoginToken {
     pub password: String,
 }
 
-// TODO: find another name
-pub struct LoadUserServiceTrait<U> (Arc<dyn LoadUserService<User = U>>);
 
-impl<U> Clone for LoadUserServiceTrait<U> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
+pub struct SessionLoginHandler<T: LoadUserService> {
+    user_service: Arc<T>
 }
 
-impl<U> LoadUserServiceTrait<U> {
-    pub fn new(us: impl LoadUserService<User = U> +'static) -> Self {
-        Self(Arc::new(us))
+impl<T> SessionLoginHandler<T> 
+where
+    T: LoadUserService
+{
+    pub fn new(user_service: T) -> Self {
+        Self {
+            user_service: Arc::new(user_service),
+        }
     }
+
 }
 
+impl<T> ::actix_web::dev::HttpServiceFactory for SessionLoginHandler<T>
+where 
+    T: LoadUserService + 'static
+{
+    fn register(self, __config: &mut actix_web::dev::AppService) {
 
-impl<U> Deref for LoadUserServiceTrait<U> {
-    type Target = Arc<dyn LoadUserService<User = U>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[post("/login")]
-async fn login(login_token: Json<LoginToken>, user_service: Data<LoadUserServiceTrait<MyUser>>, req: HttpRequest) -> Result<impl Responder, Error> {
-    match user_service.load_user(&login_token.username, &login_token.password).await {
-        Ok(u) => {
-            user_service.on_success_handler(&req, &u).await?;
-            Ok(HttpResponse::Ok())
-        },
-        Err(e) => {
-            user_service.on_error_handler(&req).await?;
-            Err(e.into())
-        },
+        async fn login<T: LoadUserService>(
+            login_token: Json<LoginToken>,
+            user_service: Data<Arc<T>>,
+            req: HttpRequest,
+        ) -> Result<impl Responder, Error> {
+            match user_service
+                .load_user(&login_token.username, &login_token.password)
+                .await
+            {
+                Ok(u) => {
+                    user_service.on_success_handler(&req, &u).await?;
+                    Ok(HttpResponse::Ok())
+                }
+                Err(e) => {
+                    user_service.on_error_handler(&req).await?;
+                    Err(e.into())
+                }
+            }
+        }
+        
+        let __resource = ::actix_web::Resource::new("/login")
+            .name("login")
+            .guard(::actix_web::guard::Post())
+            .app_data(Data::new(Arc::clone(&self.user_service)))
+            .to(login::<T>);
+        ::actix_web::dev::HttpServiceFactory::register(__resource, __config);
     }
 }
 
@@ -119,13 +133,10 @@ async fn login(login_token: Json<LoginToken>, user_service: Data<LoadUserService
 async fn main() -> std::io::Result<()>{
     std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
-    // let user_service: Arc<dyn LoadUserService<User = MyUser>> = Arc::new(HardCodedLoadUserService {});
 
-    let user_service = LoadUserServiceTrait::new(HardCodedLoadUserService {});
     HttpServer::new(move || {
         App::new()
-            .service(login)
-            .app_data(Data::new(user_service.clone()))
+            .service(SessionLoginHandler::new(HardCodedLoadUserService {}))
 
     }).bind(("127.0.0.1", 8080))?
     .run()
